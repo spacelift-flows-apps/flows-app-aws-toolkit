@@ -1,4 +1,4 @@
-import { AppBlock, EntityInput, EntityOnHTTPRequestInput, EntityOnInternalMessageInput, events, messaging, lifecycle, kv, AppContext } from "@slflows/sdk/v1";
+import { AppBlock, EntityInput, EntityOnHTTPRequestInput, EntityOnInternalMessageInput, events, messaging, lifecycle, kv, AppContext, EventInput } from "@slflows/sdk/v1";
 import { ListSubscriptionsByTopicCommand, ListSubscriptionsByTopicCommandInput, SNSClient, SubscribeCommand, SubscribeCommandInput, UnsubscribeCommand, UnsubscribeCommandInput } from "@aws-sdk/client-sns";
 import SnsValidator from "sns-validator";
 
@@ -51,7 +51,7 @@ export const subscribeSNSTopic: AppBlock = {
 	inputs: {
 		configChange: {
 			name: "Configuration Change",
-			onEvent: async (input) => {
+			onEvent: async (input: EventInput) => {
 				// Configuration updated, delete the if it exists subscription
 				// and trigger sync.
 				const subscriptionArn = input.block.lifecycle?.signals?.subscriptionArn
@@ -63,6 +63,7 @@ export const subscribeSNSTopic: AppBlock = {
 					}
 				}
 
+				// NOTE: Perhaps, we should set it to draft again?
 				await lifecycle.sync();
 
 				return
@@ -153,7 +154,9 @@ export const subscribeSNSTopic: AppBlock = {
 				switch (subscriptionState.status) {
 					case SubscriptionStatus.PENDING:
 						if (!subscriptionState.createdAt) {
-							// Should never happen.
+							// Should never happen with pending status.
+							console.warn("Pending subscription doesn't have initialization time")
+
 							break
 						}
 
@@ -170,6 +173,9 @@ export const subscribeSNSTopic: AppBlock = {
 						}
 					case SubscriptionStatus.FAILED:
 						return {
+							signalUpdates: {
+								subscriptionArn: null
+							},
 							newStatus: "failed",
 							customStatusDescription: subscriptionState.description
 						}
@@ -195,11 +201,11 @@ export const subscribeSNSTopic: AppBlock = {
 			console.error(errMsg)
 
 			return {
-				newStatus: "failed",
-				customStatusDescription: errMsg,
 				signalUpdates: {
 					subscriptionArn: null
-				}
+				},
+				newStatus: "failed",
+				customStatusDescription: errMsg
 			}
 		}
 
@@ -213,11 +219,11 @@ export const subscribeSNSTopic: AppBlock = {
 		})
 
 		return {
-			newStatus: "in_progress",
-			nextScheduleDelay: subscriptionRecheckSeconds,
 			signalUpdates: {
 				subscriptionArn: response.SubscriptionArn
-			}
+			},
+			newStatus: "in_progress",
+			nextScheduleDelay: subscriptionRecheckSeconds
 		}
 	},
 	async onDrain(input: EntityInput) {
@@ -316,7 +322,7 @@ async function deleteSubscription(app: AppContext, blockRegion: string, subscrip
 	const response = await client.send(command);
 
 	if (response.$metadata.httpStatusCode !== 200) {
-		throw new Error(`Couldn't issue SNS Unsubscribe command, statusCode: ${response.$metadata.httpStatusCode}`)
+		throw new Error(`Couldn't issue SNS unsubscribe command, statusCode: ${response.$metadata.httpStatusCode}`)
 	}
 
 	await kv.block.delete([subscriptionConfirmationKey])

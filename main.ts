@@ -3,7 +3,6 @@ import { blocks } from "./blocks";
 
 export const app = defineApp({
 	name: "AWS ToolKit",
-	installationInstructions: "A list of AWS utilities",
 	config: {
 		accessKeyId: {
 			name: "AWS Access Key ID",
@@ -31,13 +30,6 @@ export const app = defineApp({
 			type: "string",
 			required: false,
 		},
-	},
-	async onSync(_input) {
-		// TODO: Check that credentials are OK?
-
-		return {
-			newStatus: "ready"
-		}
 	},
 	blocks: blocks,
 });
