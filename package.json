@@ -1,6 +1,7 @@
 {
   "type": "module",
   "dependencies": {
+    "@aws-sdk/client-sns": "^3.943.0",
     "@slflows/sdk": "^0.0.7",
     "typescript": "^5.8.3"
   },
