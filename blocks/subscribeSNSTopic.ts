@@ -1,7 +1,6 @@
 import { AppBlock, EntityInput, EntityOnHTTPRequestInput, EntityOnInternalMessageInput, events, messaging, lifecycle, kv } from "@slflows/sdk/v1";
 import { ListSubscriptionsByTopicCommand, ListSubscriptionsByTopicCommandInput, SNSClient, SubscribeCommand, SubscribeCommandInput, UnsubscribeCommand, UnsubscribeCommandInput } from "@aws-sdk/client-sns";
-
-const subscriptionConfirmationKey = "subscription-confirmation"
+import SnsValidator from "sns-validator";
 
 enum SubscriptionStatus {
 	PENDING,
@@ -15,8 +14,11 @@ interface SubscriptionState {
 	createdAt?: number
 }
 
+const subscriptionConfirmationKey = "subscription-confirmation"
 const subscriptionTimeoutSeconds = 30
 const subscriptionRecheckSeconds = 5
+
+const validator = new SnsValidator();
 
 export const subscribeSNSTopic: AppBlock = {
 	name: "Subscribe to SNS topic",
@@ -237,10 +239,17 @@ export const subscribeSNSTopic: AppBlock = {
 	},
 	http: {
 		async onRequest(input: EntityOnHTTPRequestInput) {
-			// Forward requests to internal message handler.
-			messaging.sendToBlocks({
-				body: input.request.body,
-				blockIds: [input.block.id]
+			validator.validate(input.request.body, (err) => {
+				if (err) {
+					console.error(`"SNS message verification failed: ${err.message}`)
+					return
+				}
+
+				// Forward validated requests to internal message handler.
+				messaging.sendToBlocks({
+					body: input.request.body,
+					blockIds: [input.block.id]
+				})
 			})
 		},
 	},
