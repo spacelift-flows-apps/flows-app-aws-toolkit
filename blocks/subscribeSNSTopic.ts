@@ -54,7 +54,6 @@ export const subscribeSNSTopic: AppBlock = {
 					if (response.status === 200) {
 						kv.block.set({
 							key: subscriptionConfirmationKey,
-							ttl: subscriptionTimeoutSeconds,
 							value: {
 								status: SubscriptionStatus.CONFIRMED
 							} as PendingSubscription
@@ -168,6 +167,7 @@ export const subscribeSNSTopic: AppBlock = {
 			newStatus: "ready"
 		}
 	},
+	// TODO: Implement onDrain to cleanup subscription.
 	http: {
 		async onRequest(input: EntityOnHTTPRequestInput) {
 			// Forward requests to insert message handler.

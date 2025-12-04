@@ -33,7 +33,7 @@ export const app = defineApp({
 		},
 	},
 	async onSync(_input) {
-		// Check that credentials are OK?
+		// TODO: Check that credentials are OK?
 
 		return {
 			newStatus: "ready"
