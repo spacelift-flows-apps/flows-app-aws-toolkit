@@ -1,4 +1,4 @@
-import { AppBlock, EntityInput, EntityOnHTTPRequestInput, EntityOnInternalMessageInput, events, messaging, lifecycle, kv } from "@slflows/sdk/v1";
+import { AppBlock, EntityInput, EntityOnHTTPRequestInput, EntityOnInternalMessageInput, events, messaging, lifecycle, kv, AppContext } from "@slflows/sdk/v1";
 import { ListSubscriptionsByTopicCommand, ListSubscriptionsByTopicCommandInput, SNSClient, SubscribeCommand, SubscribeCommandInput, UnsubscribeCommand, UnsubscribeCommandInput } from "@aws-sdk/client-sns";
 import SnsValidator from "sns-validator";
 
@@ -47,6 +47,27 @@ export const subscribeSNSTopic: AppBlock = {
 			},
 			required: false,
 		},
+	},
+	inputs: {
+		configChange: {
+			name: "Configuration Change",
+			onEvent: async (input) => {
+				// Configuration updated, delete the if it exists subscription
+				// and trigger sync.
+				const subscriptionArn = input.block.lifecycle?.signals?.subscriptionArn
+				if (subscriptionArn) {
+					try {
+						await deleteSubscription(input.app, input.block.config.region, subscriptionArn)
+					} catch (err: any) {
+						console.error(err.message)
+					}
+				}
+
+				await lifecycle.sync();
+
+				return
+			}
+		}
 	},
 	signals: {
 		subscriptionArn: {
@@ -115,7 +136,7 @@ export const subscribeSNSTopic: AppBlock = {
 
 		// We must ensure that subscription exists.
 		if (subscriptionArn) {
-			const subscriptionExists = await topicSubscriptionExists(client, input.block.config.topicArn, subscriptionArn)
+			const subscriptionExists = await checkTopicSubscriptionExists(client, input.block.config.topicArn, subscriptionArn)
 			if (subscriptionExists) {
 				await kv.block.delete([subscriptionConfirmationKey])
 
@@ -203,34 +224,18 @@ export const subscribeSNSTopic: AppBlock = {
 		const subscriptionArn = input.block.lifecycle?.signals?.subscriptionArn
 
 		if (subscriptionArn) {
-			const client = new SNSClient({
-				region: input.block.config.region,
-				credentials: {
-					accessKeyId: input.app.config.accessKeyId,
-					secretAccessKey: input.app.config.secretAccessKey,
-					sessionToken: input.app.config.sessionToken,
-				},
-				endpoint: input.app.config.endpoint,
-			});
+			await kv.block.delete([subscriptionConfirmationKey])
 
-			const command = new UnsubscribeCommand({
-				SubscriptionArn: subscriptionArn,
-			} as UnsubscribeCommandInput)
-
-			const response = await client.send(command);
-
-			if (response.$metadata.httpStatusCode !== 200) {
-				const errMsg = `Couldn't issue SNS Unsubscribe command, statusCode: ${response.$metadata.httpStatusCode}`
-
-				console.error(errMsg)
+			try {
+				await deleteSubscription(input.app, input.block.config.region, subscriptionArn)
+			} catch (err: any) {
+				console.error(err.message)
 
 				return {
 					newStatus: "draining_failed",
-					customStatusDescription: errMsg
+					customStatusDescription: err.message
 				}
 			}
-
-			await kv.block.delete([subscriptionConfirmationKey])
 		}
 
 		return {
@@ -271,7 +276,7 @@ export const subscribeSNSTopic: AppBlock = {
 	},
 };
 
-async function topicSubscriptionExists(client: SNSClient, topicArn: string, subscriptionArn: string, nextToken?: string): Promise<boolean> {
+async function checkTopicSubscriptionExists(client: SNSClient, topicArn: string, subscriptionArn: string, nextToken?: string): Promise<boolean> {
 	const command = new ListSubscriptionsByTopicCommand({
 		TopicArn: topicArn,
 		NextToken: nextToken,
@@ -287,8 +292,32 @@ async function topicSubscriptionExists(client: SNSClient, topicArn: string, subs
 	}
 
 	if (response.NextToken) {
-		return topicSubscriptionExists(client, topicArn, subscriptionArn, response.NextToken)
+		return checkTopicSubscriptionExists(client, topicArn, subscriptionArn, response.NextToken)
 	}
 
 	return false
+}
+
+async function deleteSubscription(app: AppContext, blockRegion: string, subscriptionArn: string) {
+	const client = new SNSClient({
+		region: blockRegion,
+		credentials: {
+			accessKeyId: app.config.accessKeyId,
+			secretAccessKey: app.config.secretAccessKey,
+			sessionToken: app.config.sessionToken,
+		},
+		endpoint: app.config.endpoint,
+	});
+
+	const command = new UnsubscribeCommand({
+		SubscriptionArn: subscriptionArn,
+	} as UnsubscribeCommandInput)
+
+	const response = await client.send(command);
+
+	if (response.$metadata.httpStatusCode !== 200) {
+		throw new Error(`Couldn't issue SNS Unsubscribe command, statusCode: ${response.$metadata.httpStatusCode}`)
+	}
+
+	await kv.block.delete([subscriptionConfirmationKey])
 }
