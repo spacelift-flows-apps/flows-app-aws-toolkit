@@ -1,5 +1,5 @@
 import { AppBlock, EntityInput, EntityOnHTTPRequestInput, EntityOnInternalMessageInput, events, messaging, lifecycle, kv } from "@slflows/sdk/v1";
-import { SNSClient, SubscribeCommand, SubscribeCommandInput } from "@aws-sdk/client-sns";
+import { SNSClient, SubscribeCommand, SubscribeCommandInput, UnsubscribeCommand, UnsubscribeCommandInput } from "@aws-sdk/client-sns";
 
 const subscriptionConfirmationKey = "subscription-confirmation"
 
@@ -9,9 +9,12 @@ enum SubscriptionStatus {
 	CONFIRMED
 }
 
-interface PendingSubscription {
+interface Subscription {
+	arn: string,
 	status: SubscriptionStatus,
-	description: string
+
+	// Failed statuses may include description.
+	description?: string
 }
 
 const subscriptionTimeoutSeconds = 30
@@ -48,6 +51,14 @@ export const subscribeSNSTopic: AppBlock = {
 	async onInternalMessage(input: EntityOnInternalMessageInput) {
 		switch (input.message.body.Type) {
 			case "SubscriptionConfirmation":
+				const storedValue = await kv.block.get(subscriptionConfirmationKey);
+				if (!storedValue.value) {
+					console.warn("Received unexpected subscription confirmation request")
+					return
+				}
+
+				const subscription = storedValue.value as Subscription;
+
 				try {
 					const response = await fetch(input.message.body.SubscribeURL);
 
@@ -55,17 +66,19 @@ export const subscribeSNSTopic: AppBlock = {
 						kv.block.set({
 							key: subscriptionConfirmationKey,
 							value: {
+								arn: subscription.arn,
 								status: SubscriptionStatus.CONFIRMED
-							} as PendingSubscription
+							} as Subscription
 						})
 					} else {
 						kv.block.set({
 							key: subscriptionConfirmationKey,
 							ttl: subscriptionTimeoutSeconds,
 							value: {
+								arn: subscription.arn,
 								status: SubscriptionStatus.FAILED,
 								description: `Rejected SNS subscription confirmation, status code: ${response.status}`
-							} as PendingSubscription
+							} as Subscription
 						})
 					}
 				} catch (error: any) {
@@ -73,9 +86,10 @@ export const subscribeSNSTopic: AppBlock = {
 						key: subscriptionConfirmationKey,
 						ttl: subscriptionTimeoutSeconds,
 						value: {
+							arn: subscription.arn,
 							status: SubscriptionStatus.FAILED,
 							description: `Failed to confirm SNS subscription: ${error.message}`
-						} as PendingSubscription
+						} as Subscription
 					})
 				}
 
@@ -130,14 +144,13 @@ export const subscribeSNSTopic: AppBlock = {
 				}
 			}
 
-			console.log(`Issued SNS subscribe command, Subscription ARN: ${response.SubscriptionArn}`)
-
 			await kv.block.set({
 				key: subscriptionConfirmationKey,
 				ttl: subscriptionTimeoutSeconds,
 				value: {
+					arn: response.SubscriptionArn,
 					status: SubscriptionStatus.PENDING
-				} as PendingSubscription
+				} as Subscription
 			})
 
 			return {
@@ -146,20 +159,20 @@ export const subscribeSNSTopic: AppBlock = {
 			}
 		}
 
-		const pendingSubscription = storedValue.value as PendingSubscription;
+		const subscription = storedValue.value as Subscription;
 
-		switch (pendingSubscription.status) {
+		switch (subscription.status) {
 			case SubscriptionStatus.PENDING:
 				return {
 					newStatus: "in_progress",
 					nextScheduleDelay: subscriptionRecheckSeconds
 				}
 			case SubscriptionStatus.FAILED:
-				console.error(pendingSubscription.description)
+				console.error(subscription.description)
 
 				return {
 					newStatus: "failed",
-					customStatusDescription: pendingSubscription.description
+					customStatusDescription: subscription.description
 				}
 		}
 
@@ -167,11 +180,48 @@ export const subscribeSNSTopic: AppBlock = {
 			newStatus: "ready"
 		}
 	},
-	// TODO: Implement onDrain to cleanup subscription.
+	async onDrain(input: EntityInput) {
+		const storedValue = await kv.block.get(subscriptionConfirmationKey);
+
+		if (storedValue.value) {
+			const subscription = storedValue.value as Subscription;
+
+			const client = new SNSClient({
+				region: input.block.config.region,
+				credentials: {
+					accessKeyId: input.app.config.accessKeyId,
+					secretAccessKey: input.app.config.secretAccessKey,
+					sessionToken: input.app.config.sessionToken,
+				},
+				endpoint: input.app.config.endpoint,
+			});
+
+			const command = new UnsubscribeCommand({
+				SubscriptionArn: subscription.arn,
+			} as UnsubscribeCommandInput)
+
+			const response = await client.send(command);
+
+			if (response.$metadata.httpStatusCode !== 200) {
+				const errMsg = `Couldn't issue SNS Unsubscribe command, statusCode: ${response.$metadata.httpStatusCode}`
+
+				console.error(errMsg)
+
+				return {
+					newStatus: "draining_failed",
+					customStatusDescription: errMsg
+				}
+			}
+
+			await kv.block.delete([subscriptionConfirmationKey])
+		}
+
+		return {
+			newStatus: "drained"
+		}
+	},
 	http: {
 		async onRequest(input: EntityOnHTTPRequestInput) {
-			console.info(input.request.body)
-
 			// Forward requests to internal message handler.
 			messaging.sendToBlocks({
 				body: input.request.body,
