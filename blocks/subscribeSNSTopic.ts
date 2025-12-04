@@ -1,5 +1,5 @@
 import { AppBlock, EntityInput, EntityOnHTTPRequestInput, EntityOnInternalMessageInput, events, messaging, lifecycle, kv } from "@slflows/sdk/v1";
-import { SNSClient, SubscribeCommand, SubscribeCommandInput, UnsubscribeCommand, UnsubscribeCommandInput } from "@aws-sdk/client-sns";
+import { ListSubscriptionsByTopicCommand, ListSubscriptionsByTopicCommandInput, SNSClient, SubscribeCommand, SubscribeCommandInput, UnsubscribeCommand, UnsubscribeCommandInput } from "@aws-sdk/client-sns";
 
 const subscriptionConfirmationKey = "subscription-confirmation"
 
@@ -9,12 +9,10 @@ enum SubscriptionStatus {
 	CONFIRMED
 }
 
-interface Subscription {
-	arn: string,
-	status: SubscriptionStatus,
-
-	// Failed statuses may include description.
+interface SubscriptionState {
+	status: SubscriptionStatus
 	description?: string
+	createdAt?: number
 }
 
 const subscriptionTimeoutSeconds = 30
@@ -48,48 +46,42 @@ export const subscribeSNSTopic: AppBlock = {
 			required: false,
 		},
 	},
+	signals: {
+		subscriptionArn: {
+			name: "Subscription Arn",
+			description: "The ARN of the subscription."
+		},
+	},
 	async onInternalMessage(input: EntityOnInternalMessageInput) {
 		switch (input.message.body.Type) {
 			case "SubscriptionConfirmation":
-				const storedValue = await kv.block.get(subscriptionConfirmationKey);
-				if (!storedValue.value) {
-					console.warn("Received unexpected subscription confirmation request")
-					return
-				}
-
-				const subscription = storedValue.value as Subscription;
-
 				try {
 					const response = await fetch(input.message.body.SubscribeURL);
 
-					if (response.status === 200) {
+					if (response.status !== 200) {
+						const errMsg = `Confirming subscription, status code: ${response.status}`
+
+						console.error(errMsg)
+
 						kv.block.set({
 							key: subscriptionConfirmationKey,
 							value: {
-								arn: subscription.arn,
-								status: SubscriptionStatus.CONFIRMED
-							} as Subscription
-						})
-					} else {
-						kv.block.set({
-							key: subscriptionConfirmationKey,
-							ttl: subscriptionTimeoutSeconds,
-							value: {
-								arn: subscription.arn,
 								status: SubscriptionStatus.FAILED,
-								description: `Rejected SNS subscription confirmation, status code: ${response.status}`
-							} as Subscription
+								description: errMsg
+							} as SubscriptionState
 						})
 					}
 				} catch (error: any) {
+					const errMsg = `Sending confirm subscription requeste: ${error.message}`
+
+					console.error(errMsg)
+
 					kv.block.set({
 						key: subscriptionConfirmationKey,
-						ttl: subscriptionTimeoutSeconds,
 						value: {
-							arn: subscription.arn,
 							status: SubscriptionStatus.FAILED,
-							description: `Failed to confirm SNS subscription: ${error.message}`
-						} as Subscription
+							description: errMsg
+						} as SubscriptionState
 					})
 				}
 
@@ -107,85 +99,108 @@ export const subscribeSNSTopic: AppBlock = {
 		}
 	},
 	async onSync(input: EntityInput) {
-		const storedValue = await kv.block.get(subscriptionConfirmationKey);
+		const client = new SNSClient({
+			region: input.block.config.region,
+			credentials: {
+				accessKeyId: input.app.config.accessKeyId,
+				secretAccessKey: input.app.config.secretAccessKey,
+				sessionToken: input.app.config.sessionToken,
+			},
+			endpoint: input.app.config.endpoint,
+		});
 
-		if (!storedValue.value) {
-			const client = new SNSClient({
-				region: input.block.config.region,
-				credentials: {
-					accessKeyId: input.app.config.accessKeyId,
-					secretAccessKey: input.app.config.secretAccessKey,
-					sessionToken: input.app.config.sessionToken,
-				},
-				endpoint: input.app.config.endpoint,
-			});
+		const subscriptionArn = input.block.lifecycle?.signals?.subscriptionArn
 
-			const endpointURL = input.block.http!.url
-			const isSecure = endpointURL.startsWith("https")
-
-			const command = new SubscribeCommand({
-				TopicArn: input.block.config.topicArn,
-				Protocol: isSecure ? "https" : "http",
-				Endpoint: endpointURL,
-				Attributes: input.block.config.attributes,
-				ReturnSubscriptionArn: true
-			} as SubscribeCommandInput);
-
-			const response = await client.send(command);
-
-			if (response.$metadata.httpStatusCode !== 200) {
-				const errMsg = `Couldn't issue SNS Subscribe command, statusCode: ${response.$metadata.httpStatusCode}`
-
-				console.error(errMsg)
+		// We must ensure that subscription exists.
+		if (subscriptionArn) {
+			const subscriptionExists = await topicSubscriptionExists(client, input.block.config.topicArn, subscriptionArn)
+			if (subscriptionExists) {
+				await kv.block.delete([subscriptionConfirmationKey])
 
 				return {
-					newStatus: "failed",
-					customStatusDescription: errMsg
+					newStatus: "ready"
 				}
 			}
 
-			await kv.block.set({
-				key: subscriptionConfirmationKey,
-				ttl: subscriptionTimeoutSeconds,
-				value: {
-					arn: response.SubscriptionArn,
-					status: SubscriptionStatus.PENDING
-				} as Subscription
-			})
+			const rawSubscriptionState = await kv.block.get(subscriptionConfirmationKey)
+
+			if (rawSubscriptionState.value) {
+				const subscriptionState = rawSubscriptionState.value as SubscriptionState
+
+				switch (subscriptionState.status) {
+					case SubscriptionStatus.PENDING:
+						if (!subscriptionState.createdAt) {
+							// Should never happen.
+							break
+						}
+
+						// In case we weren't able to receive a confirmation
+						// message within a reasonable amount of time, we
+						// retry creating a subscription.
+						if ((Date.now() - subscriptionState.createdAt) / 1000 > subscriptionTimeoutSeconds) {
+							break
+						}
+
+						return {
+							newStatus: "in_progress",
+							nextScheduleDelay: subscriptionRecheckSeconds
+						}
+					case SubscriptionStatus.FAILED:
+						return {
+							newStatus: "failed",
+							customStatusDescription: subscriptionState.description
+						}
+				}
+			}
+		}
+
+		const endpointURL = input.block.http!.url
+
+		const command = new SubscribeCommand({
+			TopicArn: input.block.config.topicArn,
+			Protocol: endpointURL.startsWith("https") ? "https" : "http",
+			Endpoint: endpointURL,
+			Attributes: input.block.config.attributes,
+			ReturnSubscriptionArn: true
+		} as SubscribeCommandInput);
+
+		const response = await client.send(command);
+
+		if (response.$metadata.httpStatusCode !== 200) {
+			const errMsg = `Couldn't issue SNS Subscribe command, statusCode: ${response.$metadata.httpStatusCode}`
+
+			console.error(errMsg)
 
 			return {
-				newStatus: "in_progress",
-				nextScheduleDelay: subscriptionRecheckSeconds
+				newStatus: "failed",
+				customStatusDescription: errMsg,
+				signalUpdates: {
+					subscriptionArn: null
+				}
 			}
 		}
 
-		const subscription = storedValue.value as Subscription;
-
-		switch (subscription.status) {
-			case SubscriptionStatus.PENDING:
-				return {
-					newStatus: "in_progress",
-					nextScheduleDelay: subscriptionRecheckSeconds
-				}
-			case SubscriptionStatus.FAILED:
-				console.error(subscription.description)
-
-				return {
-					newStatus: "failed",
-					customStatusDescription: subscription.description
-				}
-		}
+		await kv.block.set({
+			key: subscriptionConfirmationKey,
+			ttl: subscriptionTimeoutSeconds,
+			value: {
+				status: SubscriptionStatus.PENDING,
+				createdAt: Date.now(),
+			} as SubscriptionState
+		})
 
 		return {
-			newStatus: "ready"
+			newStatus: "in_progress",
+			nextScheduleDelay: subscriptionRecheckSeconds,
+			signalUpdates: {
+				subscriptionArn: response.SubscriptionArn
+			}
 		}
 	},
 	async onDrain(input: EntityInput) {
-		const storedValue = await kv.block.get(subscriptionConfirmationKey);
+		const subscriptionArn = input.block.lifecycle?.signals?.subscriptionArn
 
-		if (storedValue.value) {
-			const subscription = storedValue.value as Subscription;
-
+		if (subscriptionArn) {
 			const client = new SNSClient({
 				region: input.block.config.region,
 				credentials: {
@@ -197,7 +212,7 @@ export const subscribeSNSTopic: AppBlock = {
 			});
 
 			const command = new UnsubscribeCommand({
-				SubscriptionArn: subscription.arn,
+				SubscriptionArn: subscriptionArn,
 			} as UnsubscribeCommandInput)
 
 			const response = await client.send(command);
@@ -246,3 +261,25 @@ export const subscribeSNSTopic: AppBlock = {
 		},
 	},
 };
+
+async function topicSubscriptionExists(client: SNSClient, topicArn: string, subscriptionArn: string, nextToken?: string): Promise<boolean> {
+	const command = new ListSubscriptionsByTopicCommand({
+		TopicArn: topicArn,
+		NextToken: nextToken,
+	} as ListSubscriptionsByTopicCommandInput)
+
+	const response = await client.send(command);
+
+	// List subscriptions doesn't return Arns for unconfirmed subscriptions.
+	if (response.Subscriptions?.findIndex((v => {
+		return v.SubscriptionArn === subscriptionArn
+	})) !== -1) {
+		return true
+	}
+
+	if (response.NextToken) {
+		return topicSubscriptionExists(client, topicArn, subscriptionArn, response.NextToken)
+	}
+
+	return false
+}
