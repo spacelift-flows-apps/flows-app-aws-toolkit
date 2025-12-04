@@ -83,10 +83,8 @@ export const subscribeSNSTopic: AppBlock = {
 
 				break;
 			case "Notification":
-				const msg = input.message.body.Message;
-
 				await events.emit({
-					message: msg
+					message: input.message.body
 				})
 
 				break;
@@ -116,7 +114,7 @@ export const subscribeSNSTopic: AppBlock = {
 				Protocol: isSecure ? "https" : "http",
 				Endpoint: endpointURL,
 				Attributes: input.block.config.attributes,
-				RneturnSubscriptionArn: input.block.config.returnSubscriptionArn
+				ReturnSubscriptionArn: true
 			} as SubscribeCommandInput);
 
 			const response = await client.send(command);
@@ -131,6 +129,8 @@ export const subscribeSNSTopic: AppBlock = {
 					customStatusDescription: errMsg
 				}
 			}
+
+			console.log(`Issued SNS subscribe command, Subscription ARN: ${response.SubscriptionArn}`)
 
 			await kv.block.set({
 				key: subscriptionConfirmationKey,
@@ -170,7 +170,9 @@ export const subscribeSNSTopic: AppBlock = {
 	// TODO: Implement onDrain to cleanup subscription.
 	http: {
 		async onRequest(input: EntityOnHTTPRequestInput) {
-			// Forward requests to insert message handler.
+			console.info(input.request.body)
+
+			// Forward requests to internal message handler.
 			messaging.sendToBlocks({
 				body: input.request.body,
 				blockIds: [input.block.id]
