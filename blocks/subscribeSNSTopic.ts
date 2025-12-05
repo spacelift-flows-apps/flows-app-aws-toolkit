@@ -32,7 +32,7 @@ interface SubscriptionState {
 
 const subscriptionConfirmationKey = "subscription-confirmation";
 
-const subscriptionTimeoutSeconds = 30;
+const subscriptionTimeoutSeconds = 180;
 const subscriptionRecheckSeconds = 5;
 
 const validator = new SnsValidator();
