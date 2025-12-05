@@ -7,6 +7,7 @@ import {
   messaging,
   lifecycle,
   kv,
+  http,
   AppContext,
   EventInput,
 } from "@slflows/sdk/v1";
@@ -34,6 +35,8 @@ interface SubscriptionState {
 }
 
 const subscriptionConfirmationKey = "subscription-confirmation";
+const subscriptionResetKey = "subscription-reset";
+
 const subscriptionTimeoutSeconds = 30;
 const subscriptionRecheckSeconds = 5;
 
@@ -72,12 +75,14 @@ export const subscribeSNSTopic: AppBlock = {
     configChange: {
       name: "Configuration Change",
       onEvent: async (input: EventInput) => {
+        console.log("Config change?");
+
         // Configuration updated, delete the if it exists subscription
         // and trigger sync.
         const subscriptionArn = input.block.lifecycle?.signals?.subscriptionArn;
         if (subscriptionArn) {
           try {
-            await deleteSubscription(
+            await deleteTopicSubscription(
               input.app,
               input.block.config.region,
               subscriptionArn,
@@ -87,10 +92,44 @@ export const subscribeSNSTopic: AppBlock = {
           }
         }
 
-        // NOTE: Perhaps, we should set it to draft again?
-        await lifecycle.sync();
+        // Reset subscription to draft.
+        kv.block.set({
+          key: subscriptionResetKey,
+          value: true,
+        });
 
-        return;
+        await lifecycle.sync();
+      },
+    },
+  },
+  outputs: {
+    default: {
+      name: "On Message",
+      description: "Emitted SNS message payload",
+      type: {
+        type: "object",
+        properties: {
+          payload: {
+            type: "object",
+            description: "Incoming SNS Topic message payload.",
+            properties: {
+              message: {
+                type: "string",
+                description: "Message text.",
+              },
+              messageId: {
+                type: "string",
+                description: "Unique message identifier.",
+              },
+              timestamp: {
+                type: "string",
+                description: "Time at which the message was published.",
+              },
+            },
+            required: ["message", "messageId", "timestamp"],
+          },
+        },
+        required: ["payload"],
       },
     },
   },
@@ -100,53 +139,19 @@ export const subscribeSNSTopic: AppBlock = {
       description: "The ARN of the subscription.",
     },
   },
-  async onInternalMessage(input: EntityOnInternalMessageInput) {
-    switch (input.message.body.Type) {
-      case "SubscriptionConfirmation":
-        try {
-          const response = await fetch(input.message.body.SubscribeURL);
-
-          if (response.status !== 200) {
-            const errMsg = `Confirming subscription, status code: ${response.status}`;
-
-            console.error(errMsg);
-
-            kv.block.set({
-              key: subscriptionConfirmationKey,
-              value: {
-                status: SubscriptionStatus.FAILED,
-                description: errMsg,
-              } as SubscriptionState,
-            });
-          }
-        } catch (error: any) {
-          const errMsg = `Sending confirm subscription requeste: ${error.message}`;
-
-          console.error(errMsg);
-
-          kv.block.set({
-            key: subscriptionConfirmationKey,
-            value: {
-              status: SubscriptionStatus.FAILED,
-              description: errMsg,
-            } as SubscriptionState,
-          });
-        }
-
-        lifecycle.sync();
-
-        break;
-      case "Notification":
-        await events.emit({
-          message: input.message.body,
-        });
-
-        break;
-      default:
-        console.warn(`Unexpected SNS message type: ${input.message.body.Type}`);
-    }
-  },
   async onSync(input: EntityInput) {
+    const resetSubscription = await kv.block.get(subscriptionResetKey);
+    if (resetSubscription.value) {
+      kv.block.delete([subscriptionResetKey]);
+
+      return {
+        signalUpdates: {
+          subscriptionArn: null,
+        },
+        newStatus: "draft",
+      };
+    }
+
     const client = new SNSClient({
       region: input.block.config.region,
       credentials: {
@@ -269,7 +274,7 @@ export const subscribeSNSTopic: AppBlock = {
       await kv.block.delete([subscriptionConfirmationKey]);
 
       try {
-        await deleteSubscription(
+        await deleteTopicSubscription(
           input.app,
           input.block.config.region,
           subscriptionArn,
@@ -290,37 +295,79 @@ export const subscribeSNSTopic: AppBlock = {
   },
   http: {
     async onRequest(input: EntityOnHTTPRequestInput) {
-      validator.validate(input.request.body, (err) => {
-        if (err) {
-          console.error(`"SNS message verification failed: ${err.message}`);
-          return;
-        }
+      await new Promise<void>((resolve, reject) => {
+        validator.validate(input.request.body, async (err) => {
+          if (err) {
+            console.error(`SNS message verification failed: ${err.message}`);
+            return reject(err);
+          }
 
-        // Forward validated requests to internal message handler.
-        messaging.sendToBlocks({
-          body: input.request.body,
-          blockIds: [input.block.id],
+          try {
+            await handleTopicSubscriptionMesage(input.request.body);
+            resolve();
+          } catch (e) {
+            reject(e);
+          }
         });
+      });
+
+      await http.respond(input.request.requestId, {
+        statusCode: 200,
       });
     },
   },
-  outputs: {
-    default: {
-      name: "On Message",
-      description: "Emitted SNS message payload",
-      type: {
-        type: "object",
-        properties: {
-          message: {
-            type: "string",
-            description: "Incoming SNS Topic message.",
-          },
-        },
-        required: ["message"],
-      },
-    },
-  },
 };
+
+async function handleTopicSubscriptionMesage(input: any) {
+  switch (input.Type) {
+    case "SubscriptionConfirmation":
+      try {
+        const response = await fetch(input.SubscribeURL);
+
+        if (response.status !== 200) {
+          const errMsg = `Confirming subscription, status code: ${response.status}`;
+
+          console.error(errMsg);
+
+          kv.block.set({
+            key: subscriptionConfirmationKey,
+            value: {
+              status: SubscriptionStatus.FAILED,
+              description: errMsg,
+            } as SubscriptionState,
+          });
+        }
+      } catch (error: any) {
+        const errMsg = `Sending confirm subscription requeste: ${error.message}`;
+
+        console.error(errMsg);
+
+        kv.block.set({
+          key: subscriptionConfirmationKey,
+          value: {
+            status: SubscriptionStatus.FAILED,
+            description: errMsg,
+          } as SubscriptionState,
+        });
+      }
+
+      lifecycle.sync();
+
+      break;
+    case "Notification":
+      await events.emit({
+        payload: {
+          message: input.Message,
+          messageId: input.MessageId,
+          timestamp: input.Timestamp,
+        },
+      });
+
+      break;
+    default:
+      console.warn(`Unexpected SNS message type: ${input.Type}`);
+  }
+}
 
 async function checkTopicSubscriptionExists(
   client: SNSClient,
@@ -356,7 +403,7 @@ async function checkTopicSubscriptionExists(
   return false;
 }
 
-async function deleteSubscription(
+async function deleteTopicSubscription(
   app: AppContext,
   blockRegion: string,
   subscriptionArn: string,
