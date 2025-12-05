@@ -22,7 +22,6 @@ import SnsValidator from "sns-validator";
 enum SubscriptionStatus {
   PENDING,
   FAILED,
-  CONFIRMED,
 }
 
 interface SubscriptionState {
