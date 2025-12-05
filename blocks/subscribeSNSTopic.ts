@@ -151,7 +151,7 @@ export const subscribeSNSTopic: AppBlock = {
               subscriptionTimeoutSeconds
             ) {
               console.warn(
-                `Timeout while confirming subscription, retrying creating a subscription`
+                `Timeout while confirming subscription, retrying creating a subscription`,
               );
 
               break;
@@ -175,7 +175,7 @@ export const subscribeSNSTopic: AppBlock = {
 
     const command = new SubscribeCommand({
       TopicArn: input.block.config.topicArn,
-      Protocol:  "https",
+      Protocol: "https",
       Endpoint: input.block.http!.url,
       Attributes: input.block.config.attributes,
       ReturnSubscriptionArn: true,
@@ -281,7 +281,7 @@ async function handleTopicSubscriptionMesage(input: any) {
             value: {
               status: SubscriptionStatus.FAILED,
               description: errMsg,
-              createdAt: Date.now()
+              createdAt: Date.now(),
             } as SubscriptionState,
           });
         }
@@ -295,7 +295,7 @@ async function handleTopicSubscriptionMesage(input: any) {
           value: {
             status: SubscriptionStatus.FAILED,
             description: errMsg,
-            createdAt: Date.now()
+            createdAt: Date.now(),
           } as SubscriptionState,
         });
       }
