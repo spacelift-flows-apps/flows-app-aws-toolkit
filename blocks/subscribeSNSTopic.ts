@@ -26,8 +26,8 @@ enum SubscriptionStatus {
 
 interface SubscriptionState {
   status: SubscriptionStatus;
+  createdAt: number;
   description?: string;
-  createdAt?: number;
 }
 
 const subscriptionConfirmationKey = "subscription-confirmation";
@@ -143,15 +143,6 @@ export const subscribeSNSTopic: AppBlock = {
 
         switch (subscriptionState.status) {
           case SubscriptionStatus.PENDING:
-            if (!subscriptionState.createdAt) {
-              // Should never happen with pending status.
-              console.warn(
-                "Pending subscription doesn't have initialization time",
-              );
-
-              break;
-            }
-
             // In case we weren't able to receive a confirmation
             // message within a reasonable amount of time, we
             // retry creating a subscription.
@@ -159,6 +150,10 @@ export const subscribeSNSTopic: AppBlock = {
               (Date.now() - subscriptionState.createdAt) / 1000 >
               subscriptionTimeoutSeconds
             ) {
+              console.warn(
+                `Timeout while confirming subscription, retrying creating a subscription`
+              );
+
               break;
             }
 
@@ -178,12 +173,10 @@ export const subscribeSNSTopic: AppBlock = {
       }
     }
 
-    const endpointURL = input.block.http!.url;
-
     const command = new SubscribeCommand({
       TopicArn: input.block.config.topicArn,
-      Protocol: endpointURL.startsWith("https") ? "https" : "http",
-      Endpoint: endpointURL,
+      Protocol:  "https",
+      Endpoint: input.block.http!.url,
       Attributes: input.block.config.attributes,
       ReturnSubscriptionArn: true,
     } as SubscribeCommandInput);
@@ -191,7 +184,7 @@ export const subscribeSNSTopic: AppBlock = {
     const response = await client.send(command);
 
     if (response.$metadata.httpStatusCode !== 200) {
-      const errMsg = `Couldn't issue SNS Subscribe command, statusCode: ${response.$metadata.httpStatusCode}`;
+      const errMsg = `Failed to issue subscribe command, statusCode: ${response.$metadata.httpStatusCode}`;
 
       console.error(errMsg);
 
@@ -252,7 +245,7 @@ export const subscribeSNSTopic: AppBlock = {
       await new Promise<void>((resolve, reject) => {
         validator.validate(input.request.body, async (err) => {
           if (err) {
-            console.error(`SNS message verification failed: ${err.message}`);
+            console.error(`Failed to verify message origin: ${err.message}`);
             return reject(err);
           }
 
@@ -279,7 +272,7 @@ async function handleTopicSubscriptionMesage(input: any) {
         const response = await fetch(input.SubscribeURL);
 
         if (response.status !== 200) {
-          const errMsg = `Confirming subscription, status code: ${response.status}`;
+          const errMsg = `Failed to confirm subscription, status code: ${response.status}`;
 
           console.error(errMsg);
 
@@ -288,11 +281,12 @@ async function handleTopicSubscriptionMesage(input: any) {
             value: {
               status: SubscriptionStatus.FAILED,
               description: errMsg,
+              createdAt: Date.now()
             } as SubscriptionState,
           });
         }
       } catch (error: any) {
-        const errMsg = `Sending confirm subscription requeste: ${error.message}`;
+        const errMsg = `Failed to issue confirm subscription request: ${error.message}`;
 
         console.error(errMsg);
 
@@ -301,6 +295,7 @@ async function handleTopicSubscriptionMesage(input: any) {
           value: {
             status: SubscriptionStatus.FAILED,
             description: errMsg,
+            createdAt: Date.now()
           } as SubscriptionState,
         });
       }
@@ -319,7 +314,7 @@ async function handleTopicSubscriptionMesage(input: any) {
 
       break;
     default:
-      console.warn(`Unexpected SNS message type: ${input.Type}`);
+      console.warn(`Received an unexpected message type: ${input.Type}`);
   }
 }
 
@@ -380,7 +375,7 @@ async function deleteTopicSubscription(
 
   if (response.$metadata.httpStatusCode !== 200) {
     throw new Error(
-      `Couldn't issue SNS unsubscribe command, statusCode: ${response.$metadata.httpStatusCode}`,
+      `Failed to issue unsubscribe command, statusCode: ${response.$metadata.httpStatusCode}`,
     );
   }
 
