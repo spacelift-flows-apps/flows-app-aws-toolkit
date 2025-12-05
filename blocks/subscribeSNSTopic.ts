@@ -39,22 +39,21 @@ const validator = new SnsValidator();
 
 export const subscribeSNSTopic: AppBlock = {
   name: "Subscribe to SNS topic",
-  description:
-    "Subscribes to an AWS SNS topic and emits messages as events.",
+  description: "Subscribes to an AWS SNS topic and emits messages as events.",
   config: {
     region: {
       name: "Region",
       description: "AWS region where SNS topic is located.",
       type: "string",
       required: true,
-      fixed: true
+      fixed: true,
     },
     topicArn: {
       name: "Topic Arn",
       description: "The ARN of the topic you want to subscribe to.",
       type: "string",
       required: true,
-      fixed: true
+      fixed: true,
     },
     attributes: {
       name: "Attributes",
@@ -66,7 +65,7 @@ export const subscribeSNSTopic: AppBlock = {
         },
       },
       required: false,
-      fixed: true
+      fixed: true,
     },
   },
   outputs: {
