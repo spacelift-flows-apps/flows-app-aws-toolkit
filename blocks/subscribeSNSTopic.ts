@@ -7,7 +7,6 @@ import {
   kv,
   http,
   AppContext,
-  EventInput,
 } from "@slflows/sdk/v1";
 import {
   ListSubscriptionsByTopicCommand,
@@ -33,7 +32,6 @@ interface SubscriptionState {
 }
 
 const subscriptionConfirmationKey = "subscription-confirmation";
-const subscriptionResetKey = "subscription-reset";
 
 const subscriptionTimeoutSeconds = 30;
 const subscriptionRecheckSeconds = 5;
@@ -67,37 +65,6 @@ export const subscribeSNSTopic: AppBlock = {
         },
       },
       required: false,
-    },
-  },
-  inputs: {
-    configChange: {
-      name: "Configuration Change",
-      onEvent: async (input: EventInput) => {
-        console.log("Config change?");
-
-        // Configuration updated, delete the if it exists subscription
-        // and trigger sync.
-        const subscriptionArn = input.block.lifecycle?.signals?.subscriptionArn;
-        if (subscriptionArn) {
-          try {
-            await deleteTopicSubscription(
-              input.app,
-              input.block.config.region,
-              subscriptionArn,
-            );
-          } catch (err: any) {
-            console.error(err.message);
-          }
-        }
-
-        // Reset subscription to draft.
-        kv.block.set({
-          key: subscriptionResetKey,
-          value: true,
-        });
-
-        await lifecycle.sync();
-      },
     },
   },
   outputs: {
@@ -138,18 +105,6 @@ export const subscribeSNSTopic: AppBlock = {
     },
   },
   async onSync(input: EntityInput) {
-    const resetSubscription = await kv.block.get(subscriptionResetKey);
-    if (resetSubscription.value) {
-      kv.block.delete([subscriptionResetKey]);
-
-      return {
-        signalUpdates: {
-          subscriptionArn: null,
-        },
-        newStatus: "draft",
-      };
-    }
-
     const client = new SNSClient({
       region: input.block.config.region,
       credentials: {
