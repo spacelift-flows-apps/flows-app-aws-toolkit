@@ -242,6 +242,11 @@ export const subscribeSNSTopic: AppBlock = {
   },
   http: {
     async onRequest(input: EntityOnHTTPRequestInput) {
+      if (input.block.config.topicArn !== input.request.body.TopicArn) {
+        console.warn(`Received message from a different topic`);
+        return;
+      }
+
       await new Promise<void>((resolve, reject) => {
         validator.validate(input.request.body, async (err) => {
           if (err) {
