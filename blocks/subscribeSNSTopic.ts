@@ -80,6 +80,11 @@ export const subscribeSNSTopic: AppBlock = {
             description: "Incoming SNS Topic message payload.",
             properties: {
               message: {
+                type: "any",
+                description:
+                  "In case the received message is a valid JSON, this will contain message as a JSON.",
+              },
+              rawMessage: {
                 type: "string",
                 description: "Message text.",
               },
@@ -123,7 +128,7 @@ export const subscribeSNSTopic: AppBlock = {
       const subscriptionExists = await checkTopicSubscriptionExists(
         client,
         input.block.config.topicArn,
-        subscriptionArn,
+        subscriptionArn
       );
       if (subscriptionExists) {
         await kv.block.delete([subscriptionConfirmationKey]);
@@ -134,7 +139,7 @@ export const subscribeSNSTopic: AppBlock = {
       }
 
       const rawSubscriptionState = await kv.block.get(
-        subscriptionConfirmationKey,
+        subscriptionConfirmationKey
       );
 
       if (rawSubscriptionState.value) {
@@ -151,7 +156,7 @@ export const subscribeSNSTopic: AppBlock = {
               subscriptionTimeoutSeconds
             ) {
               console.warn(
-                `Timeout while confirming subscription, retrying creating a subscription`,
+                `Timeout while confirming subscription, retrying creating a subscription`
               );
 
               break;
@@ -224,7 +229,7 @@ export const subscribeSNSTopic: AppBlock = {
         await deleteTopicSubscription(
           input.app,
           input.block.config.region,
-          subscriptionArn,
+          subscriptionArn
         );
       } catch (err: any) {
         console.error(err.message);
@@ -309,9 +314,18 @@ async function handleTopicSubscriptionMesage(input: any) {
 
       break;
     case "Notification":
+      let message: any;
+
+      try {
+        message = JSON.parse(input.Message);
+      } catch {
+        message = {};
+      }
+
       await events.emit({
         payload: {
-          message: input.Message,
+          message: message,
+          rawMessage: input.Message,
           messageId: input.MessageId,
           timestamp: input.Timestamp,
         },
@@ -327,7 +341,7 @@ async function checkTopicSubscriptionExists(
   client: SNSClient,
   topicArn: string,
   subscriptionArn: string,
-  nextToken?: string,
+  nextToken?: string
 ): Promise<boolean> {
   const command = new ListSubscriptionsByTopicCommand({
     TopicArn: topicArn,
@@ -350,7 +364,7 @@ async function checkTopicSubscriptionExists(
       client,
       topicArn,
       subscriptionArn,
-      response.NextToken,
+      response.NextToken
     );
   }
 
@@ -360,7 +374,7 @@ async function checkTopicSubscriptionExists(
 async function deleteTopicSubscription(
   app: AppContext,
   blockRegion: string,
-  subscriptionArn: string,
+  subscriptionArn: string
 ) {
   const client = new SNSClient({
     region: blockRegion,
@@ -380,7 +394,7 @@ async function deleteTopicSubscription(
 
   if (response.$metadata.httpStatusCode !== 200) {
     throw new Error(
-      `Failed to issue unsubscribe command, statusCode: ${response.$metadata.httpStatusCode}`,
+      `Failed to issue unsubscribe command, statusCode: ${response.$metadata.httpStatusCode}`
     );
   }
 
