@@ -1,0 +1,443 @@
+import {
+  AppBlock,
+  EntityInput,
+  EntityOnHTTPRequestInput,
+  events,
+  kv,
+  http,
+} from "@slflows/sdk/v1";
+import {
+  EventBridgeClient,
+  CreateConnectionCommand,
+  CreateApiDestinationCommand,
+  PutRuleCommand,
+  PutTargetsCommand,
+  RemoveTargetsCommand,
+  DeleteRuleCommand,
+  DeleteApiDestinationCommand,
+  DeleteConnectionCommand,
+  DescribeRuleCommand,
+  DescribeConnectionCommand,
+} from "@aws-sdk/client-eventbridge";
+import { randomBytes } from "crypto";
+
+const kvKeyApiKey = "api-key";
+const kvKeyConnectionArn = "connection-arn";
+const kvKeyApiDestinationArn = "api-destination-arn";
+const kvKeyRuleArn = "rule-arn";
+
+const syncTimeoutSeconds = 120;
+
+function sanitizeResourceName(blockId: string, suffix: string): string {
+  const sanitized = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
+  const prefix = `flows-${sanitized}`;
+  const name = `${prefix}-${suffix}`;
+  return name.slice(0, 64);
+}
+
+function createClient(input: EntityInput): EventBridgeClient {
+  return new EventBridgeClient({
+    region: input.block.config.region,
+    credentials: {
+      accessKeyId: input.app.config.accessKeyId,
+      secretAccessKey: input.app.config.secretAccessKey,
+      sessionToken: input.app.config.sessionToken,
+    },
+    endpoint: input.app.config.endpoint,
+  });
+}
+
+export const subscribeEventBridgeRule: AppBlock = {
+  name: "Subscribe to EventBridge Rule",
+  description:
+    "Creates an EventBridge rule with an API Destination target, forwarding matched events to this block's HTTP endpoint.",
+  config: {
+    region: {
+      name: "Region",
+      description: "AWS region where EventBridge is located.",
+      type: "string",
+      required: true,
+      fixed: true,
+    },
+    eventBusName: {
+      name: "Event Bus Name",
+      description:
+        "The name or ARN of the event bus to monitor. Defaults to the default event bus.",
+      type: "string",
+      required: true,
+      fixed: true,
+    },
+    eventPattern: {
+      name: "Event Pattern",
+      description:
+        'JSON event pattern for matching events (e.g. {"source": ["aws.ec2"]}).',
+      type: "string",
+      required: true,
+      fixed: true,
+    },
+    roleArn: {
+      name: "Role ARN",
+      description:
+        "IAM role ARN that EventBridge assumes to invoke the API Destination.",
+      type: "string",
+      required: true,
+      fixed: true,
+    },
+  },
+  outputs: {
+    default: {
+      name: "On Event",
+      description: "Emitted EventBridge event payload",
+      type: {
+        type: "object",
+        properties: {
+          payload: {
+            type: "object",
+            description: "Incoming EventBridge event payload.",
+            properties: {
+              event: {
+                type: "any",
+                description: "Full EventBridge event object.",
+              },
+              source: {
+                type: "string",
+                description: 'Event source (e.g. "aws.ec2").',
+              },
+              detailType: {
+                type: "string",
+                description: "Detail type of the event.",
+              },
+              detail: {
+                type: "any",
+                description: "Event detail payload.",
+              },
+              time: {
+                type: "string",
+                description: "Event timestamp.",
+              },
+            },
+            required: ["event", "source", "detailType", "detail", "time"],
+          },
+        },
+        required: ["payload"],
+      },
+    },
+  },
+  signals: {
+    ruleArn: {
+      name: "Rule ARN",
+      description: "The ARN of the EventBridge rule.",
+    },
+    connectionArn: {
+      name: "Connection ARN",
+      description: "The ARN of the EventBridge connection.",
+    },
+    apiDestinationArn: {
+      name: "API Destination ARN",
+      description: "The ARN of the EventBridge API Destination.",
+    },
+  },
+  async onSync(input: EntityInput) {
+    const signals = input.block.lifecycle?.signals;
+    const ruleArn = signals?.ruleArn;
+    const connectionArn = signals?.connectionArn;
+    const apiDestinationArn = signals?.apiDestinationArn;
+
+    const client = createClient(input);
+
+    // If all signals exist, verify the rule still exists
+    if (ruleArn && connectionArn && apiDestinationArn) {
+      try {
+        const connName = sanitizeResourceName(input.block.id, "conn");
+        const ruleName = sanitizeResourceName(input.block.id, "rule");
+
+        await client.send(
+          new DescribeRuleCommand({
+            Name: ruleName,
+            EventBusName: input.block.config.eventBusName,
+          }),
+        );
+        await client.send(new DescribeConnectionCommand({ Name: connName }));
+
+        return { newStatus: "ready" };
+      } catch (err: any) {
+        if (
+          err.name === "ResourceNotFoundException" ||
+          err.name === "ResourceNotFoundFault"
+        ) {
+          // Resources gone, recreate from scratch
+          console.warn("Resources missing, recreating from scratch");
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    // State machine: resume from where we left off
+    const startTime = Date.now();
+    const blockId = input.block.id;
+    const connName = sanitizeResourceName(blockId, "conn");
+    const destName = sanitizeResourceName(blockId, "dest");
+    const ruleName = sanitizeResourceName(blockId, "rule");
+
+    // Step 1: Generate API key
+    let apiKey = (await kv.block.get(kvKeyApiKey)).value as string | null;
+    if (!apiKey) {
+      apiKey = randomBytes(32).toString("hex");
+      await kv.block.set({ key: kvKeyApiKey, value: apiKey });
+    }
+
+    // Step 2: Create Connection
+    let connArn = (await kv.block.get(kvKeyConnectionArn)).value as
+      | string
+      | null;
+    if (!connArn) {
+      if (Date.now() - startTime > syncTimeoutSeconds * 1000) {
+        return {
+          newStatus: "failed",
+          customStatusDescription: "Timeout during resource creation",
+        };
+      }
+
+      try {
+        const resp = await client.send(
+          new CreateConnectionCommand({
+            Name: connName,
+            AuthorizationType: "API_KEY",
+            AuthParameters: {
+              ApiKeyAuthParameters: {
+                ApiKeyName: "x-api-key",
+                ApiKeyValue: apiKey,
+              },
+            },
+          }),
+        );
+        connArn = resp.ConnectionArn!;
+      } catch (err: any) {
+        if (err.name === "ResourceAlreadyExistsException") {
+          const desc = await client.send(
+            new DescribeConnectionCommand({ Name: connName }),
+          );
+          connArn = desc.ConnectionArn!;
+        } else {
+          throw err;
+        }
+      }
+
+      await kv.block.set({ key: kvKeyConnectionArn, value: connArn });
+    }
+
+    // Step 3: Create API Destination
+    let destArn = (await kv.block.get(kvKeyApiDestinationArn)).value as
+      | string
+      | null;
+    if (!destArn) {
+      if (Date.now() - startTime > syncTimeoutSeconds * 1000) {
+        return {
+          newStatus: "failed",
+          customStatusDescription: "Timeout during resource creation",
+        };
+      }
+
+      try {
+        const resp = await client.send(
+          new CreateApiDestinationCommand({
+            Name: destName,
+            ConnectionArn: connArn,
+            InvocationEndpoint: input.block.http!.url,
+            HttpMethod: "POST",
+            InvocationRateLimitPerSecond: 300,
+          }),
+        );
+        destArn = resp.ApiDestinationArn!;
+      } catch (err: any) {
+        if (err.name === "ResourceAlreadyExistsException") {
+          // Describe not available for API Destinations; re-derive ARN from connection
+          // Delete and recreate to ensure correct endpoint
+          try {
+            await client.send(
+              new DeleteApiDestinationCommand({ Name: destName }),
+            );
+          } catch {
+            // ignore
+          }
+          const resp = await client.send(
+            new CreateApiDestinationCommand({
+              Name: destName,
+              ConnectionArn: connArn,
+              InvocationEndpoint: input.block.http!.url,
+              HttpMethod: "POST",
+              InvocationRateLimitPerSecond: 300,
+            }),
+          );
+          destArn = resp.ApiDestinationArn!;
+        } else {
+          throw err;
+        }
+      }
+
+      await kv.block.set({ key: kvKeyApiDestinationArn, value: destArn });
+    }
+
+    // Step 4: Create Rule
+    let ruleArnResult = (await kv.block.get(kvKeyRuleArn)).value as
+      | string
+      | null;
+    if (!ruleArnResult) {
+      if (Date.now() - startTime > syncTimeoutSeconds * 1000) {
+        return {
+          newStatus: "failed",
+          customStatusDescription: "Timeout during resource creation",
+        };
+      }
+
+      const resp = await client.send(
+        new PutRuleCommand({
+          Name: ruleName,
+          EventBusName: input.block.config.eventBusName,
+          EventPattern: input.block.config.eventPattern,
+          State: "ENABLED",
+        }),
+      );
+      ruleArnResult = resp.RuleArn!;
+
+      await kv.block.set({ key: kvKeyRuleArn, value: ruleArnResult });
+    }
+
+    // Step 5: Put Target
+    if (Date.now() - startTime > syncTimeoutSeconds * 1000) {
+      return {
+        newStatus: "failed",
+        customStatusDescription: "Timeout during resource creation",
+      };
+    }
+
+    await client.send(
+      new PutTargetsCommand({
+        Rule: ruleName,
+        EventBusName: input.block.config.eventBusName,
+        Targets: [
+          {
+            Id: "flows-target",
+            Arn: destArn,
+            RoleArn: input.block.config.roleArn,
+            HttpParameters: {
+              HeaderParameters: {
+                "x-api-key": apiKey,
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    return {
+      signalUpdates: {
+        ruleArn: ruleArnResult,
+        connectionArn: connArn,
+        apiDestinationArn: destArn,
+      },
+      newStatus: "ready",
+    };
+  },
+  async onDrain(input: EntityInput) {
+    const client = createClient(input);
+    const blockId = input.block.id;
+    const connName = sanitizeResourceName(blockId, "conn");
+    const destName = sanitizeResourceName(blockId, "dest");
+    const ruleName = sanitizeResourceName(blockId, "rule");
+    const eventBusName = input.block.config.eventBusName;
+
+    // 1. Remove targets
+    try {
+      await client.send(
+        new RemoveTargetsCommand({
+          Rule: ruleName,
+          EventBusName: eventBusName,
+          Ids: ["flows-target"],
+        }),
+      );
+    } catch (err: any) {
+      if (err.name !== "ResourceNotFoundException") {
+        console.error(`Failed to remove targets: ${err.message}`);
+      }
+    }
+
+    // 2. Delete rule
+    try {
+      await client.send(
+        new DeleteRuleCommand({
+          Name: ruleName,
+          EventBusName: eventBusName,
+        }),
+      );
+    } catch (err: any) {
+      if (err.name !== "ResourceNotFoundException") {
+        console.error(`Failed to delete rule: ${err.message}`);
+      }
+    }
+
+    // 3. Delete API destination
+    try {
+      await client.send(new DeleteApiDestinationCommand({ Name: destName }));
+    } catch (err: any) {
+      if (err.name !== "ResourceNotFoundException") {
+        console.error(`Failed to delete API destination: ${err.message}`);
+      }
+    }
+
+    // 4. Delete connection
+    try {
+      await client.send(new DeleteConnectionCommand({ Name: connName }));
+    } catch (err: any) {
+      if (err.name !== "ResourceNotFoundException") {
+        console.error(`Failed to delete connection: ${err.message}`);
+      }
+    }
+
+    // 5. Clean up KV
+    await kv.block.delete([
+      kvKeyApiKey,
+      kvKeyConnectionArn,
+      kvKeyApiDestinationArn,
+      kvKeyRuleArn,
+    ]);
+
+    return {
+      newStatus: "drained",
+    };
+  },
+  http: {
+    async onRequest(input: EntityOnHTTPRequestInput) {
+      const storedApiKey = (await kv.block.get(kvKeyApiKey)).value as
+        | string
+        | null;
+
+      const requestApiKey = input.request.headers?.["x-api-key"];
+
+      if (!storedApiKey || requestApiKey !== storedApiKey) {
+        await http.respond(input.request.requestId, {
+          statusCode: 401,
+          body: "Unauthorized",
+        });
+        return;
+      }
+
+      const body = input.request.body;
+
+      await events.emit({
+        payload: {
+          event: body,
+          source: body.source ?? "",
+          detailType: body["detail-type"] ?? "",
+          detail: body.detail ?? {},
+          time: body.time ?? "",
+        },
+      });
+
+      await http.respond(input.request.requestId, {
+        statusCode: 200,
+      });
+    },
+  },
+};
