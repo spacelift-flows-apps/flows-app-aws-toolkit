@@ -81,6 +81,7 @@ export const subscribeEventBridgeRule: AppBlock = {
         "IAM role ARN that EventBridge assumes to invoke the API Destination.",
       type: "string",
       required: true,
+      sensitive: true,
       fixed: true,
     },
   },
@@ -413,7 +414,7 @@ export const subscribeEventBridgeRule: AppBlock = {
         | string
         | null;
 
-      const requestApiKey = input.request.headers?.["x-api-key"];
+      const requestApiKey = input.request.headers?.["X-Api-Key"];
 
       if (!storedApiKey || requestApiKey !== storedApiKey) {
         await http.respond(input.request.requestId, {
