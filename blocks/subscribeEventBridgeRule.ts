@@ -198,7 +198,7 @@ export const subscribeEventBridgeRule: AppBlock = {
     roleArn: {
       name: "Role ARN",
       description:
-        "IAM role ARN that EventBridge assumes to invoke the API Destination.",
+        "IAM role ARN that EventBridge assumes to invoke the API Destination. The role must trust events.amazonaws.com (sts:AssumeRole) and allow events:InvokeApiDestination.",
       type: "string",
       required: true,
       fixed: true,
