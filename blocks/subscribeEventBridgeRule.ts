@@ -181,8 +181,7 @@ export const subscribeEventBridgeRule: AppBlock = {
     },
     eventBusName: {
       name: "Event Bus Name",
-      description:
-        "The name or ARN of the event bus to monitor.",
+      description: "The name or ARN of the event bus to monitor.",
       type: "string",
       required: false,
       default: "default",
@@ -263,7 +262,11 @@ export const subscribeEventBridgeRule: AppBlock = {
     const client = createClient(input);
 
     // If all signals exist, verify resources still exist
-    if (signals?.ruleArn && signals?.connectionArn && signals?.apiDestinationArn) {
+    if (
+      signals?.ruleArn &&
+      signals?.connectionArn &&
+      signals?.apiDestinationArn
+    ) {
       try {
         const connName = sanitizeResourceName(input.block.id, "conn");
         const ruleName = sanitizeResourceName(input.block.id, "rule");
