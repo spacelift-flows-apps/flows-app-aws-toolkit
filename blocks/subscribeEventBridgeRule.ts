@@ -190,9 +190,10 @@ export const subscribeEventBridgeRule: AppBlock = {
     eventPattern: {
       name: "Event Pattern",
       description:
-        'JSON event pattern for matching events (e.g. {"source": ["aws.ec2"]}).',
+        'JSON event pattern for matching events (e.g. {"source": ["aws.ec2"]}). Matches all events by default.',
       type: "string",
-      required: true,
+      required: false,
+      default: '{"source": [{"wildcard": "*"}]}',
       fixed: true,
     },
     roleArn: {
