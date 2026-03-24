@@ -26,8 +26,6 @@ const kvKeyConnectionArn = "connection-arn";
 const kvKeyApiDestinationArn = "api-destination-arn";
 const kvKeyRuleArn = "rule-arn";
 
-const syncTimeoutSeconds = 120;
-
 function sanitizeResourceName(blockId: string, suffix: string): string {
   const sanitized = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
   const prefix = `flows-${sanitized}`;
@@ -47,6 +45,128 @@ function createClient(input: EntityInput): EventBridgeClient {
   });
 }
 
+async function ensureApiKey(): Promise<string> {
+  let apiKey = (await kv.block.get(kvKeyApiKey)).value as string | null;
+  if (!apiKey) {
+    apiKey = randomBytes(32).toString("hex");
+    await kv.block.set({ key: kvKeyApiKey, value: apiKey });
+  }
+  return apiKey;
+}
+
+async function ensureConnection(
+  client: EventBridgeClient,
+  name: string,
+  apiKey: string,
+): Promise<string> {
+  const existing = (await kv.block.get(kvKeyConnectionArn)).value as
+    | string
+    | null;
+  if (existing) return existing;
+
+  let arn: string;
+  try {
+    const resp = await client.send(
+      new CreateConnectionCommand({
+        Name: name,
+        AuthorizationType: "API_KEY",
+        AuthParameters: {
+          ApiKeyAuthParameters: {
+            ApiKeyName: "x-api-key",
+            ApiKeyValue: apiKey,
+          },
+        },
+      }),
+    );
+    arn = resp.ConnectionArn!;
+  } catch (err: any) {
+    if (err.name === "ResourceAlreadyExistsException") {
+      const desc = await client.send(
+        new DescribeConnectionCommand({ Name: name }),
+      );
+      arn = desc.ConnectionArn!;
+    } else {
+      throw err;
+    }
+  }
+
+  await kv.block.set({ key: kvKeyConnectionArn, value: arn });
+  return arn;
+}
+
+async function ensureApiDestination(
+  client: EventBridgeClient,
+  name: string,
+  connectionArn: string,
+  endpoint: string,
+): Promise<string> {
+  const existing = (await kv.block.get(kvKeyApiDestinationArn)).value as
+    | string
+    | null;
+  if (existing) return existing;
+
+  let arn: string;
+  try {
+    const resp = await client.send(
+      new CreateApiDestinationCommand({
+        Name: name,
+        ConnectionArn: connectionArn,
+        InvocationEndpoint: endpoint,
+        HttpMethod: "POST",
+        InvocationRateLimitPerSecond: 300,
+      }),
+    );
+    arn = resp.ApiDestinationArn!;
+  } catch (err: any) {
+    if (err.name === "ResourceAlreadyExistsException") {
+      // Delete and recreate to ensure correct endpoint
+      try {
+        await client.send(new DeleteApiDestinationCommand({ Name: name }));
+      } catch {
+        // ignore
+      }
+      const resp = await client.send(
+        new CreateApiDestinationCommand({
+          Name: name,
+          ConnectionArn: connectionArn,
+          InvocationEndpoint: endpoint,
+          HttpMethod: "POST",
+          InvocationRateLimitPerSecond: 300,
+        }),
+      );
+      arn = resp.ApiDestinationArn!;
+    } else {
+      throw err;
+    }
+  }
+
+  await kv.block.set({ key: kvKeyApiDestinationArn, value: arn });
+  return arn;
+}
+
+async function ensureRule(
+  client: EventBridgeClient,
+  name: string,
+  eventBusName: string,
+  eventPattern: string,
+): Promise<string> {
+  const existing = (await kv.block.get(kvKeyRuleArn)).value as string | null;
+  if (existing) return existing;
+
+  const resp = await client.send(
+    new PutRuleCommand({
+      Name: name,
+      EventBusName: eventBusName,
+      EventPattern: eventPattern,
+      State: "ENABLED",
+    }),
+  );
+  const arn = resp.RuleArn!;
+
+  await kv.block.set({ key: kvKeyRuleArn, value: arn });
+  return arn;
+}
+
 export const subscribeEventBridgeRule: AppBlock = {
   name: "Subscribe to EventBridge Rule",
   description:
@@ -62,9 +182,10 @@ export const subscribeEventBridgeRule: AppBlock = {
     eventBusName: {
       name: "Event Bus Name",
       description:
-        "The name or ARN of the event bus to monitor. Defaults to the default event bus.",
+        "The name or ARN of the event bus to monitor.",
       type: "string",
-      required: true,
+      required: false,
+      default: "default",
       fixed: true,
     },
     eventPattern: {
@@ -81,7 +202,6 @@ export const subscribeEventBridgeRule: AppBlock = {
         "IAM role ARN that EventBridge assumes to invoke the API Destination.",
       type: "string",
       required: true,
-      sensitive: true,
       fixed: true,
     },
   },
@@ -140,14 +260,10 @@ export const subscribeEventBridgeRule: AppBlock = {
   },
   async onSync(input: EntityInput) {
     const signals = input.block.lifecycle?.signals;
-    const ruleArn = signals?.ruleArn;
-    const connectionArn = signals?.connectionArn;
-    const apiDestinationArn = signals?.apiDestinationArn;
-
     const client = createClient(input);
 
-    // If all signals exist, verify the rule still exists
-    if (ruleArn && connectionArn && apiDestinationArn) {
+    // If all signals exist, verify resources still exist
+    if (signals?.ruleArn && signals?.connectionArn && signals?.apiDestinationArn) {
       try {
         const connName = sanitizeResourceName(input.block.id, "conn");
         const ruleName = sanitizeResourceName(input.block.id, "rule");
@@ -166,180 +282,72 @@ export const subscribeEventBridgeRule: AppBlock = {
           err.name === "ResourceNotFoundException" ||
           err.name === "ResourceNotFoundFault"
         ) {
-          // Resources gone, recreate from scratch
           console.warn("Resources missing, recreating from scratch");
+          await kv.block.delete([
+            kvKeyConnectionArn,
+            kvKeyApiDestinationArn,
+            kvKeyRuleArn,
+          ]);
         } else {
           throw err;
         }
       }
     }
 
-    // State machine: resume from where we left off
-    const startTime = Date.now();
     const blockId = input.block.id;
     const connName = sanitizeResourceName(blockId, "conn");
     const destName = sanitizeResourceName(blockId, "dest");
     const ruleName = sanitizeResourceName(blockId, "rule");
 
-    // Step 1: Generate API key
-    let apiKey = (await kv.block.get(kvKeyApiKey)).value as string | null;
-    if (!apiKey) {
-      apiKey = randomBytes(32).toString("hex");
-      await kv.block.set({ key: kvKeyApiKey, value: apiKey });
-    }
+    try {
+      const apiKey = await ensureApiKey();
+      const connArn = await ensureConnection(client, connName, apiKey);
+      const destArn = await ensureApiDestination(
+        client,
+        destName,
+        connArn,
+        input.block.http!.url,
+      );
+      const ruleArn = await ensureRule(
+        client,
+        ruleName,
+        input.block.config.eventBusName,
+        input.block.config.eventPattern,
+      );
 
-    // Step 2: Create Connection
-    let connArn = (await kv.block.get(kvKeyConnectionArn)).value as
-      | string
-      | null;
-    if (!connArn) {
-      if (Date.now() - startTime > syncTimeoutSeconds * 1000) {
-        return {
-          newStatus: "failed",
-          customStatusDescription: "Timeout during resource creation",
-        };
-      }
-
-      try {
-        const resp = await client.send(
-          new CreateConnectionCommand({
-            Name: connName,
-            AuthorizationType: "API_KEY",
-            AuthParameters: {
-              ApiKeyAuthParameters: {
-                ApiKeyName: "x-api-key",
-                ApiKeyValue: apiKey,
+      await client.send(
+        new PutTargetsCommand({
+          Rule: ruleName,
+          EventBusName: input.block.config.eventBusName,
+          Targets: [
+            {
+              Id: "flows-target",
+              Arn: destArn,
+              RoleArn: input.block.config.roleArn,
+              HttpParameters: {
+                HeaderParameters: {
+                  "x-api-key": apiKey,
+                },
               },
             },
-          }),
-        );
-        connArn = resp.ConnectionArn!;
-      } catch (err: any) {
-        if (err.name === "ResourceAlreadyExistsException") {
-          const desc = await client.send(
-            new DescribeConnectionCommand({ Name: connName }),
-          );
-          connArn = desc.ConnectionArn!;
-        } else {
-          throw err;
-        }
-      }
-
-      await kv.block.set({ key: kvKeyConnectionArn, value: connArn });
-    }
-
-    // Step 3: Create API Destination
-    let destArn = (await kv.block.get(kvKeyApiDestinationArn)).value as
-      | string
-      | null;
-    if (!destArn) {
-      if (Date.now() - startTime > syncTimeoutSeconds * 1000) {
-        return {
-          newStatus: "failed",
-          customStatusDescription: "Timeout during resource creation",
-        };
-      }
-
-      try {
-        const resp = await client.send(
-          new CreateApiDestinationCommand({
-            Name: destName,
-            ConnectionArn: connArn,
-            InvocationEndpoint: input.block.http!.url,
-            HttpMethod: "POST",
-            InvocationRateLimitPerSecond: 300,
-          }),
-        );
-        destArn = resp.ApiDestinationArn!;
-      } catch (err: any) {
-        if (err.name === "ResourceAlreadyExistsException") {
-          // Describe not available for API Destinations; re-derive ARN from connection
-          // Delete and recreate to ensure correct endpoint
-          try {
-            await client.send(
-              new DeleteApiDestinationCommand({ Name: destName }),
-            );
-          } catch {
-            // ignore
-          }
-          const resp = await client.send(
-            new CreateApiDestinationCommand({
-              Name: destName,
-              ConnectionArn: connArn,
-              InvocationEndpoint: input.block.http!.url,
-              HttpMethod: "POST",
-              InvocationRateLimitPerSecond: 300,
-            }),
-          );
-          destArn = resp.ApiDestinationArn!;
-        } else {
-          throw err;
-        }
-      }
-
-      await kv.block.set({ key: kvKeyApiDestinationArn, value: destArn });
-    }
-
-    // Step 4: Create Rule
-    let ruleArnResult = (await kv.block.get(kvKeyRuleArn)).value as
-      | string
-      | null;
-    if (!ruleArnResult) {
-      if (Date.now() - startTime > syncTimeoutSeconds * 1000) {
-        return {
-          newStatus: "failed",
-          customStatusDescription: "Timeout during resource creation",
-        };
-      }
-
-      const resp = await client.send(
-        new PutRuleCommand({
-          Name: ruleName,
-          EventBusName: input.block.config.eventBusName,
-          EventPattern: input.block.config.eventPattern,
-          State: "ENABLED",
+          ],
         }),
       );
-      ruleArnResult = resp.RuleArn!;
 
-      await kv.block.set({ key: kvKeyRuleArn, value: ruleArnResult });
-    }
-
-    // Step 5: Put Target
-    if (Date.now() - startTime > syncTimeoutSeconds * 1000) {
+      return {
+        signalUpdates: {
+          ruleArn,
+          connectionArn: connArn,
+          apiDestinationArn: destArn,
+        },
+        newStatus: "ready",
+      };
+    } catch (err: any) {
       return {
         newStatus: "failed",
-        customStatusDescription: "Timeout during resource creation",
+        customStatusDescription: err.message,
       };
     }
-
-    await client.send(
-      new PutTargetsCommand({
-        Rule: ruleName,
-        EventBusName: input.block.config.eventBusName,
-        Targets: [
-          {
-            Id: "flows-target",
-            Arn: destArn,
-            RoleArn: input.block.config.roleArn,
-            HttpParameters: {
-              HeaderParameters: {
-                "x-api-key": apiKey,
-              },
-            },
-          },
-        ],
-      }),
-    );
-
-    return {
-      signalUpdates: {
-        ruleArn: ruleArnResult,
-        connectionArn: connArn,
-        apiDestinationArn: destArn,
-      },
-      newStatus: "ready",
-    };
   },
   async onDrain(input: EntityInput) {
     const client = createClient(input);
@@ -348,6 +356,7 @@ export const subscribeEventBridgeRule: AppBlock = {
     const destName = sanitizeResourceName(blockId, "dest");
     const ruleName = sanitizeResourceName(blockId, "rule");
     const eventBusName = input.block.config.eventBusName;
+    const errors: string[] = [];
 
     // 1. Remove targets
     try {
@@ -361,6 +370,7 @@ export const subscribeEventBridgeRule: AppBlock = {
     } catch (err: any) {
       if (err.name !== "ResourceNotFoundException") {
         console.error(`Failed to remove targets: ${err.message}`);
+        errors.push(err.message);
       }
     }
 
@@ -375,6 +385,7 @@ export const subscribeEventBridgeRule: AppBlock = {
     } catch (err: any) {
       if (err.name !== "ResourceNotFoundException") {
         console.error(`Failed to delete rule: ${err.message}`);
+        errors.push(err.message);
       }
     }
 
@@ -384,6 +395,7 @@ export const subscribeEventBridgeRule: AppBlock = {
     } catch (err: any) {
       if (err.name !== "ResourceNotFoundException") {
         console.error(`Failed to delete API destination: ${err.message}`);
+        errors.push(err.message);
       }
     }
 
@@ -393,6 +405,7 @@ export const subscribeEventBridgeRule: AppBlock = {
     } catch (err: any) {
       if (err.name !== "ResourceNotFoundException") {
         console.error(`Failed to delete connection: ${err.message}`);
+        errors.push(err.message);
       }
     }
 
@@ -403,6 +416,13 @@ export const subscribeEventBridgeRule: AppBlock = {
       kvKeyApiDestinationArn,
       kvKeyRuleArn,
     ]);
+
+    if (errors.length > 0) {
+      return {
+        newStatus: "draining_failed",
+        customStatusDescription: errors.join("; "),
+      };
+    }
 
     return {
       newStatus: "drained",
