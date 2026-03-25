@@ -26,11 +26,8 @@ const kvKeyConnectionArn = "connection-arn";
 const kvKeyApiDestinationArn = "api-destination-arn";
 const kvKeyRuleArn = "rule-arn";
 
-function sanitizeResourceName(blockId: string, suffix: string): string {
-  const sanitized = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
-  const prefix = `flows-${sanitized}`;
-  const name = `${prefix}-${suffix}`;
-  return name.slice(0, 64);
+function resourceName(blockId: string, suffix: string): string {
+  return `flows-${blockId}-${suffix}`;
 }
 
 function createClient(input: EntityInput): EventBridgeClient {
@@ -269,8 +266,8 @@ export const subscribeEventBridgeRule: AppBlock = {
       signals?.apiDestinationArn
     ) {
       try {
-        const connName = sanitizeResourceName(input.block.id, "conn");
-        const ruleName = sanitizeResourceName(input.block.id, "rule");
+        const connName = resourceName(input.block.id, "conn");
+        const ruleName = resourceName(input.block.id, "rule");
 
         await client.send(
           new DescribeRuleCommand({
@@ -299,9 +296,9 @@ export const subscribeEventBridgeRule: AppBlock = {
     }
 
     const blockId = input.block.id;
-    const connName = sanitizeResourceName(blockId, "conn");
-    const destName = sanitizeResourceName(blockId, "dest");
-    const ruleName = sanitizeResourceName(blockId, "rule");
+    const connName = resourceName(blockId, "conn");
+    const destName = resourceName(blockId, "dest");
+    const ruleName = resourceName(blockId, "rule");
 
     try {
       const apiKey = await ensureApiKey();
@@ -356,9 +353,9 @@ export const subscribeEventBridgeRule: AppBlock = {
   async onDrain(input: EntityInput) {
     const client = createClient(input);
     const blockId = input.block.id;
-    const connName = sanitizeResourceName(blockId, "conn");
-    const destName = sanitizeResourceName(blockId, "dest");
-    const ruleName = sanitizeResourceName(blockId, "rule");
+    const connName = resourceName(blockId, "conn");
+    const destName = resourceName(blockId, "dest");
+    const ruleName = resourceName(blockId, "rule");
     const eventBusName = input.block.config.eventBusName;
     const errors: string[] = [];
 
