@@ -191,7 +191,6 @@ export const subscribeEventBridgeRule: AppBlock = {
       type: "string",
       required: false,
       default: '{"source": [{"wildcard": "*"}]}',
-      fixed: true,
     },
     roleArn: {
       name: "Role ARN",
@@ -269,13 +268,25 @@ export const subscribeEventBridgeRule: AppBlock = {
         const connName = resourceName(input.block.id, "conn");
         const ruleName = resourceName(input.block.id, "rule");
 
-        await client.send(
+        const ruleResp = await client.send(
           new DescribeRuleCommand({
             Name: ruleName,
             EventBusName: input.block.config.eventBusName,
           }),
         );
         await client.send(new DescribeConnectionCommand({ Name: connName }));
+
+        // Update event pattern only if it changed
+        if (ruleResp.EventPattern !== input.block.config.eventPattern) {
+          await client.send(
+            new PutRuleCommand({
+              Name: ruleName,
+              EventBusName: input.block.config.eventBusName,
+              EventPattern: input.block.config.eventPattern,
+              State: "ENABLED",
+            }),
+          );
+        }
 
         return { newStatus: "ready" };
       } catch (err: any) {
