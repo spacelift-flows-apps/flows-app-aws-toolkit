@@ -39,6 +39,7 @@ const validator = new SnsValidator();
 
 export const subscribeSNSTopic: AppBlock = {
   name: "Subscribe to SNS topic",
+  entrypoint: true,
   description: "Subscribes to an AWS SNS topic and emits messages as events.",
   config: {
     region: {
@@ -80,9 +81,10 @@ export const subscribeSNSTopic: AppBlock = {
             description: "Incoming SNS Topic message payload.",
             properties: {
               message: {
-                type: "any",
+                type: "object",
                 description:
                   "In case the received message is a valid JSON, this will contain message as a JSON.",
+                additionalProperties: true,
               },
               rawMessage: {
                 type: "string",
