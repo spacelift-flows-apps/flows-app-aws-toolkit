@@ -166,6 +166,7 @@ async function ensureRule(
 
 export const subscribeEventBridgeRule: AppBlock = {
   name: "Subscribe to EventBridge Rule",
+  entrypoint: true,
   description:
     "Creates an EventBridge rule with an API Destination target, forwarding matched events to this block's HTTP endpoint.",
   config: {
@@ -213,7 +214,6 @@ export const subscribeEventBridgeRule: AppBlock = {
             description: "Incoming EventBridge event payload.",
             properties: {
               event: {
-                type: "any",
                 description: "Full EventBridge event object.",
               },
               source: {
@@ -225,7 +225,6 @@ export const subscribeEventBridgeRule: AppBlock = {
                 description: "Detail type of the event.",
               },
               detail: {
-                type: "any",
                 description: "Event detail payload.",
               },
               time: {
