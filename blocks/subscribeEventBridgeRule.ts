@@ -214,7 +214,9 @@ export const subscribeEventBridgeRule: AppBlock = {
             description: "Incoming EventBridge event payload.",
             properties: {
               event: {
+                type: "object",
                 description: "Full EventBridge event object.",
+                additionalProperties: true,
               },
               source: {
                 type: "string",
@@ -225,7 +227,9 @@ export const subscribeEventBridgeRule: AppBlock = {
                 description: "Detail type of the event.",
               },
               detail: {
+                type: "object",
                 description: "Event detail payload.",
+                additionalProperties: true,
               },
               time: {
                 type: "string",

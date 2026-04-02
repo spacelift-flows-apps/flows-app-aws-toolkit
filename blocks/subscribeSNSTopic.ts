@@ -81,8 +81,10 @@ export const subscribeSNSTopic: AppBlock = {
             description: "Incoming SNS Topic message payload.",
             properties: {
               message: {
+                type: "object",
                 description:
                   "In case the received message is a valid JSON, this will contain message as a JSON.",
+                additionalProperties: true,
               },
               rawMessage: {
                 type: "string",
